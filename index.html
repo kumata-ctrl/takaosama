@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <base target="_top">
+    <?!= include('css'); ?>
+  </head>
+  <body class="bg-light">
+
+    <!-- ログイン画面 -->
+    <div id="login-screen" class="container py-5" style="max-width: 480px;">
+      <div class="card shadow-sm">
+        <div class="card-body p-4">
+          <h4 class="card-title text-center mb-4">🔒 ログイン</h4>
+          <div class="mb-3">
+            <label for="loginPassword" class="form-label fw-bold">パスワード</label>
+            <input type="password" class="form-control" id="loginPassword" placeholder="パスワードを入力" autocomplete="current-password">
+          </div>
+          <button type="button" class="btn btn-primary w-100" id="loginBtn" onclick="login()">ログイン</button>
+          <div id="loginError" class="text-danger small mt-3 text-center"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 本体アプリ（ログイン成功後に表示） -->
+    <div id="main-app" style="display: none;">
+
+    <!-- 入力フォームセクション -->
+    <div id="inputSection" class="container py-5">
+      <h2 class="mb-4 text-center">📄 見積書 AI OCRシステム</h2>
+
+      <div class="card shadow-sm mb-4">
+        <div class="card-body">
+          <form id="uploadForm">
+            <div class="mb-3">
+              <label for="workType" class="form-label fw-bold">種別を選択してください</label>
+              <div class="d-flex gap-2">
+                <select class="form-select" id="workType">
+                  <option value="">読み込み中...</option>
+                </select>
+                <button type="button" class="btn btn-outline-secondary text-nowrap" onclick="openPromptEditor('edit')">編集</button>
+                <button type="button" class="btn btn-outline-primary text-nowrap" onclick="openPromptEditor('new')">＋新規</button>
+              </div>
+              <div class="form-text">特殊フォーマット用のプロンプトはスプレッドシートと連動しています。</div>
+            </div>
+            <div class="mb-3">
+              <label for="fileInput" class="form-label fw-bold">見積書PDFをアップロードしてください</label>
+              <div id="dropZone" class="drop-zone">
+                <div class="drop-zone-inner">
+                  <div class="drop-zone-icon">📄</div>
+                  <div class="drop-zone-text">ここに PDF をドラッグ＆ドロップ</div>
+                  <div class="drop-zone-sub">または</div>
+                  <input class="form-control" type="file" id="fileInput" accept="application/pdf" required>
+                  <div id="dropFileName" class="drop-zone-filename"></div>
+                </div>
+              </div>
+            </div>
+            <button type="button" class="btn btn-primary w-100" onclick="processFile()">
+              AIで自動読み取り
+            </button>
+          </form>
+        </div>
+      </div>
+
+      <div id="loading" class="d-none text-center my-5">
+        <div class="spinner-border text-primary" role="status"></div>
+        <p id="loadingText" class="mt-2 text-muted">AIがPDFを解析中です。しばらくお待ちください...</p>
+      </div>
+    </div>
+
+    <!-- 解析後: 左右分割表示 -->
+    <div id="splitView" class="d-none">
+      <!-- ヘッダーバー -->
+      <div class="split-header d-flex align-items-center justify-content-between px-3 bg-white border-bottom shadow-sm">
+        <span class="fw-bold">📄 見積書 AI OCRシステム</span>
+        <div class="d-flex gap-2">
+          <button class="btn btn-outline-secondary btn-sm" onclick="backToInput()">← 戻る</button>
+          <button class="btn btn-success btn-sm" onclick="downloadExcel()">Excelをダウンロード</button>
+          <button class="btn btn-primary btn-sm" onclick="downloadWord()">Wordをダウンロード</button>
+          <button class="btn btn-outline-success btn-sm" onclick="downloadCSV()">CSVをダウンロード</button>
+          <button id="copyBtn" class="btn btn-info btn-sm text-white" onclick="copyToClipboard()">クリップボードにコピー</button>
+        </div>
+      </div>
+      <!-- 分割パネル -->
+      <div class="split-body">
+        <!-- 左パネル: 原本PDF -->
+        <div class="split-panel split-left">
+          <div class="panel-label bg-secondary text-white d-flex justify-content-between align-items-center px-3">
+            <span>原本 PDF</span>
+            <div class="d-flex align-items-center gap-2">
+              <button class="btn btn-sm btn-outline-light py-0 px-2" onclick="zoomPdf(-1)">－</button>
+              <span id="pdfZoomLabel" class="small">100%</span>
+              <button class="btn btn-sm btn-outline-light py-0 px-2" onclick="zoomPdf(1)">＋</button>
+            </div>
+          </div>
+          <div id="pdfPages"></div>
+        </div>
+        <!-- リサイザー -->
+        <div id="panelResizer" class="split-resizer"></div>
+        <!-- 右パネル: OCRデータ -->
+        <div class="split-panel split-right">
+          <div class="panel-label bg-primary text-white d-flex justify-content-between align-items-center px-3">
+            <span>AI 解析結果</span>
+            <button class="btn btn-success btn-sm" onclick="addRow()">＋ 行を追加</button>
+          </div>
+          <div class="result-scroll-area">
+            <table class="table table-striped table-hover mb-0" id="resultTable">
+              <colgroup id="tableColGroup">
+                <col style="width:8%">
+                <col style="width:5%">
+                <col style="width:20%">
+                <col style="width:16%">
+                <col style="width:7%">
+                <col style="width:5%">
+                <col style="width:11%">
+                <col style="width:11%">
+                <col style="width:7%">
+                <col style="width:10%">
+              </colgroup>
+              <thead class="table-dark">
+                <tr>
+                  <th></th>
+                  <th>番号</th>
+                  <th>名称</th>
+                  <th>形状寸法</th>
+                  <th>数量</th>
+                  <th>単位</th>
+                  <th>単価</th>
+                  <th>金額</th>
+                  <th>小計</th>
+                  <th>摘要</th>
+                </tr>
+              </thead>
+              <tbody id="resultBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- プロンプト編集モーダル -->
+    <div class="modal fade" id="promptModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-xl modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="promptModalTitle">プロンプト編集</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="閉じる"></button>
+          </div>
+          <div class="modal-body">
+            <input type="hidden" id="promptEditId">
+            <div class="mb-3">
+              <label for="promptEditName" class="form-label fw-bold">項目名</label>
+              <input type="text" class="form-control" id="promptEditName" placeholder="例: LIXIL建具">
+            </div>
+            <div class="mb-3">
+              <label for="promptEditPrompt" class="form-label fw-bold mb-1">読み取り要調整部分</label>
+              <textarea class="form-control" id="promptEditPrompt" rows="18" style="font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;" placeholder="このフォーマット特有の調整内容を記載してください。"></textarea>
+              <div class="border rounded p-3 mt-2 bg-light-subtle" style="background-color: #f1f8ff; border-color: #b6d4fe !important;">
+                <div class="d-flex flex-wrap align-items-center gap-2">
+                  <button type="button" class="btn btn-success" id="genPromptBtn" onclick="generatePromptFromInstruction()">✨ AIで生成</button>
+                  <button type="button" class="btn btn-outline-secondary d-none" id="showOriginalBtn" onclick="showOriginalInstruction()">📄 原文を見る</button>
+                  <span id="genStatus" class="small text-muted"></span>
+                </div>
+                <div class="form-text mt-1 mb-0">上の調整内容を基に「AIで生成」を押すと、抽出プロンプトが生成されます。</div>
+              </div>
+              <div class="form-text mt-2">このフォーマット固有の列マッピング・抽出ルール・注意点を記載してください。JSON出力・単位記号(ｍ/m2/m3/cm/mm)・半角カタカナ・「箇所→ヶ所」など <strong>全プロンプト共通のルールは実行時に自動付与される</strong> ため、ここに書く必要はありません。</div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">キャンセル</button>
+            <button type="button" class="btn btn-primary" id="promptSaveBtn" onclick="savePromptEdit()">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 生成前の原文表示モーダル -->
+    <div class="modal fade" id="originalInstructionModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">生成前の原文</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="閉じる"></button>
+          </div>
+          <div class="modal-body">
+            <pre id="originalInstructionView" class="border rounded p-3 bg-light mb-0" style="white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; max-height: 60vh; overflow-y: auto;"></pre>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-primary" onclick="restoreOriginalInstruction()">原文に戻す</button>
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">閉じる</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    </div><!-- /#main-app -->
+
+    <?!= include('js'); ?>
+  </body>
+</html>
