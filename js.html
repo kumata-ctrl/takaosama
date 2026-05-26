@@ -1,0 +1,1003 @@
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script>
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+  let currentData = [];
+  let pageDataUrls = []; // 原本PDF表示用の画像データURL
+  let pdfZoom = 100;    // PDFズームレベル（%）
+  let promptList = [];  // スプレッドシートから取得した種別・プロンプト一覧
+
+  // =============================================
+  // 認証（共通パスワード / sessionStorage トークン）
+  // =============================================
+  const AUTH_TOKEN_KEY = 'kaneda_ocr_auth_token';
+  const AUTH_LOGGED_IN_KEY = 'kaneda_ocr_logged_in';
+  let AUTH_TOKEN = '';
+
+  function getToken() {
+    if (AUTH_TOKEN) return AUTH_TOKEN;
+    try { AUTH_TOKEN = sessionStorage.getItem(AUTH_TOKEN_KEY) || ''; } catch(_) {}
+    return AUTH_TOKEN;
+  }
+  function setToken(t) {
+    AUTH_TOKEN = t || '';
+    try {
+      if (AUTH_TOKEN) sessionStorage.setItem(AUTH_TOKEN_KEY, AUTH_TOKEN);
+      else sessionStorage.removeItem(AUTH_TOKEN_KEY);
+    } catch(_) {}
+  }
+
+  // サーバーから unauthorized が返ってきた時にログイン画面へ強制復帰
+  function handleUnauthorized() {
+    setToken('');
+    try { sessionStorage.removeItem(AUTH_LOGGED_IN_KEY); } catch(_) {}
+    document.getElementById('main-app').style.display = 'none';
+    document.getElementById('login-screen').style.display = '';
+    const err = document.getElementById('loginError');
+    if (err) err.textContent = 'セッションが切れました。再ログインしてください。';
+    setTimeout(() => {
+      const pwEl = document.getElementById('loginPassword');
+      if (pwEl) pwEl.focus();
+    }, 50);
+  }
+
+  // unauthorized レスポンスかどうかを判定
+  function isUnauthorizedRes(res) {
+    return !!(res && typeof res === 'object' && !Array.isArray(res) && res.unauthorized);
+  }
+
+  // ログイン送信
+  function login() {
+    const pwInput = document.getElementById('loginPassword');
+    const errEl = document.getElementById('loginError');
+    const btn = document.getElementById('loginBtn');
+    const pw = (pwInput.value || '').trim();
+
+    errEl.textContent = '';
+    if (!pw) { errEl.textContent = 'パスワードを入力してください。'; return; }
+
+    btn.disabled = true;
+    btn.innerText = '認証中...';
+
+    google.script.run
+      .withSuccessHandler(res => {
+        if (res && res.ok && res.token) {
+          try { sessionStorage.setItem(AUTH_LOGGED_IN_KEY, '1'); } catch(_) {}
+          setToken(res.token);
+          pwInput.value = '';
+          errEl.textContent = '';
+          showMainApp();
+        } else {
+          errEl.textContent = (res && res.message) || 'ログインに失敗しました。';
+        }
+        btn.disabled = false;
+        btn.innerText = 'ログイン';
+      })
+      .withFailureHandler(e => {
+        errEl.textContent = 'エラー: ' + (e && e.message ? e.message : e);
+        btn.disabled = false;
+        btn.innerText = 'ログイン';
+      })
+      .verifyPassword(pw);
+  }
+
+  let _mainAppInitialized = false;
+  function showMainApp() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('main-app').style.display = '';
+    if (_mainAppInitialized) return;
+    _mainAppInitialized = true;
+    loadPromptList();
+    initDropZone();
+  }
+
+  // =============================================
+  // ドラッグ&ドロップでのPDFアップロード
+  // =============================================
+  function initDropZone() {
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const fileNameEl = document.getElementById('dropFileName');
+    if (!dropZone || !fileInput) return;
+
+    // ファイル選択時にファイル名を表示
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files[0];
+      fileNameEl.textContent = f ? `選択中: ${f.name}` : '';
+    });
+
+    // ドラッグオーバーで枠線を強調
+    ['dragenter', 'dragover'].forEach(ev => {
+      dropZone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.classList.add('drag-over');
+      });
+    });
+    ['dragleave', 'drop'].forEach(ev => {
+      dropZone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (ev === 'dragleave' && e.target !== dropZone) return;
+        dropZone.classList.remove('drag-over');
+      });
+    });
+
+    // ドロップ：PDF を input にセット
+    dropZone.addEventListener('drop', (e) => {
+      const files = e.dataTransfer && e.dataTransfer.files;
+      if (!files || files.length === 0) return;
+      const file = files[0];
+      const isPdf = /\.pdf$/i.test(file.name) || file.type === 'application/pdf';
+      if (!isPdf) {
+        alert('PDFファイルのみアップロード可能です。');
+        return;
+      }
+      // DataTransfer 経由で input.files に反映（既存の processFile がそのまま使える）
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      fileInput.files = dt.files;
+      fileNameEl.textContent = `選択中: ${file.name}`;
+    });
+  }
+
+  // =============================================
+  // プロンプト一覧のロード & ドロップダウン構築
+  // =============================================
+  function loadPromptList(selectedId) {
+    google.script.run
+      .withSuccessHandler((list) => {
+        if (isUnauthorizedRes(list)) { handleUnauthorized(); return; }
+        promptList = Array.isArray(list) ? list : [];
+        const sel = document.getElementById('workType');
+        sel.innerHTML = '';
+        if (promptList.length === 0) {
+          const opt = document.createElement('option');
+          opt.value = '';
+          opt.textContent = '（プロンプト未登録）';
+          sel.appendChild(opt);
+          return;
+        }
+        promptList.forEach(p => {
+          const opt = document.createElement('option');
+          opt.value = p.id;
+          opt.textContent = p.name;
+          sel.appendChild(opt);
+        });
+        if (selectedId && promptList.some(p => p.id === selectedId)) {
+          sel.value = selectedId;
+        }
+      })
+      .withFailureHandler((err) => {
+        const sel = document.getElementById('workType');
+        sel.innerHTML = '<option value="">読み込み失敗</option>';
+        alert('プロンプト一覧の取得に失敗しました: ' + (err && err.message ? err.message : err));
+      })
+      .getPromptList(getToken());
+  }
+
+  // ページ読み込み時：ログイン状態を確認し、未ログインならログイン画面を表示
+  window.addEventListener('DOMContentLoaded', () => {
+    const tok = getToken();
+    let loggedIn = false;
+    try { loggedIn = sessionStorage.getItem(AUTH_LOGGED_IN_KEY) === '1'; } catch(_) {}
+
+    if (loggedIn && tok) {
+      showMainApp();
+    } else {
+      document.getElementById('login-screen').style.display = '';
+      document.getElementById('main-app').style.display = 'none';
+      setTimeout(() => {
+        const pwEl = document.getElementById('loginPassword');
+        if (pwEl) pwEl.focus();
+      }, 50);
+    }
+
+    // Enter キーでログイン送信
+    const pwEl = document.getElementById('loginPassword');
+    if (pwEl) {
+      pwEl.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); login(); }
+      });
+    }
+  });
+
+  // =============================================
+  // プロンプト編集モーダル
+  // =============================================
+  // 生成前の原文（指示文）を保持
+  let lastOriginalInstruction = '';
+
+  // 新規追加時にテキストエリアへ入れる初期指示文テンプレート
+  // ※ 下の「▶」の右側や「     」の中に、見積書を見ながら書き込んでください
+  const DEFAULT_INSTRUCTION_TEMPLATE = `このフォーマットの見積書からデータを抽出してください。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【1】 どんな見積書ですか？（メーカー名・工事の種類など）
+　　　例：YKKAP の建具見積書 ／ ◯◯工事の見積書
+　▶ ここに書く：
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【2】 表の列は左から順にどう並んでいますか？
+　　　見積書の表の「見出し（1行目）」をそのまま左から書き写してください。
+　　　例：番号 / 品名 / 寸法W / 寸法H / 数量 / 単位 / 単価 / 金額 / 備考
+　▶ ここに書く：
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【3】 抽出したい項目は、表のどの列に書かれていますか？
+　　　下の「　　　　」の中に、見積書の表での列名を書き入れてください。
+　　　（同じ列を複数の項目に使ってもOK。該当なしは「なし」と書く）
+
+　・名称（品名・規格）　　… 表の「　　　　　　」列
+　・形状寸法（サイズ）　　… 表の「　　　　　　」列
+　・数量　　　　　　　　 … 表の「　　　　　　」列
+　・単位（個・㎡など）　　… 表の「　　　　　　」列
+　・単価　　　　　　　　 … 表の「　　　　　　」列
+　・金額　　　　　　　　 … 表の「　　　　　　」列
+　・摘要（備考・メモ）　 … 表の「　　　　　　」列
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【4】 このフォーマット特有のクセや注意点はありますか？
+　　　思いつくものを箇条書きで。なければ空欄でOK。
+　　　例：
+　　　　・小計の行は読み飛ばしてほしい
+　　　　・「〃」の記号は1つ上の行と同じ内容として扱う
+　　　　・表紙ページ（金額のない案内ページ）は無視する
+　　　　・W列とH列を組み合わせて「W×H」の形にしたい
+　▶ ここに書く：
+　　・
+`;
+
+  function openPromptEditor(mode) {
+    const idEl   = document.getElementById('promptEditId');
+    const nameEl = document.getElementById('promptEditName');
+    const textEl = document.getElementById('promptEditPrompt');
+    const title  = document.getElementById('promptModalTitle');
+
+    // AI生成セクションを毎回リセット
+    const genStatus = document.getElementById('genStatus');
+    if (genStatus) genStatus.textContent = '';
+    lastOriginalInstruction = '';
+    const showOriginalBtn = document.getElementById('showOriginalBtn');
+    if (showOriginalBtn) showOriginalBtn.classList.add('d-none');
+
+    if (mode === 'new') {
+      idEl.value = '';
+      nameEl.value = '';
+      textEl.value = DEFAULT_INSTRUCTION_TEMPLATE;
+      title.textContent = 'プロンプト新規追加';
+    } else {
+      const selectedId = document.getElementById('workType').value;
+      const target = promptList.find(p => p.id === selectedId);
+      if (!target) {
+        alert('編集対象のプロンプトが見つかりません。');
+        return;
+      }
+      idEl.value = target.id;
+      nameEl.value = target.name;
+      textEl.value = target.prompt;
+      title.textContent = 'プロンプト編集';
+    }
+    const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('promptModal'));
+    modal.show();
+  }
+
+  function savePromptEdit() {
+    const id     = document.getElementById('promptEditId').value;
+    const name   = document.getElementById('promptEditName').value.trim();
+    const prompt = document.getElementById('promptEditPrompt').value;
+    if (!name) {
+      alert('項目名を入力してください。');
+      return;
+    }
+    const saveBtn = document.getElementById('promptSaveBtn');
+    saveBtn.disabled = true;
+    saveBtn.textContent = '保存中...';
+
+    google.script.run
+      .withSuccessHandler((saved) => {
+        if (isUnauthorizedRes(saved)) { handleUnauthorized(); return; }
+        saveBtn.disabled = false;
+        saveBtn.textContent = '保存';
+        bootstrap.Modal.getInstance(document.getElementById('promptModal')).hide();
+        loadPromptList(saved && saved.id);
+      })
+      .withFailureHandler((err) => {
+        saveBtn.disabled = false;
+        saveBtn.textContent = '保存';
+        alert('保存に失敗しました: ' + (err && err.message ? err.message : err));
+      })
+      .savePrompt(getToken(), id, name, prompt);
+  }
+
+  // テキストエリアの調整内容（指示文）からプロンプトをAI生成し、同じテキストエリアに反映
+  function generatePromptFromInstruction() {
+    const promptEl = document.getElementById('promptEditPrompt');
+    const instruction = promptEl.value;
+    if (!instruction || !instruction.trim()) {
+      alert('調整内容を入力してください。');
+      return;
+    }
+    const btn = document.getElementById('genPromptBtn');
+    const status = document.getElementById('genStatus');
+    const showOriginalBtn = document.getElementById('showOriginalBtn');
+
+    btn.disabled = true;
+    status.textContent = 'AIで生成中...（10〜30秒）';
+
+    google.script.run
+      .withSuccessHandler((generated) => {
+        if (isUnauthorizedRes(generated)) { handleUnauthorized(); return; }
+        // 生成前の原文を保存してから、テキストエリアを生成結果で置き換える
+        lastOriginalInstruction = instruction;
+        promptEl.value = generated || '';
+        if (showOriginalBtn) showOriginalBtn.classList.remove('d-none');
+        btn.disabled = false;
+        status.textContent = '生成しました。内容を確認して「保存」を押してください。';
+      })
+      .withFailureHandler((err) => {
+        btn.disabled = false;
+        status.textContent = '';
+        alert('生成に失敗しました: ' + (err && err.message ? err.message : err));
+      })
+      .generatePrompt(getToken(), instruction);
+  }
+
+  // 生成前の原文をモーダルで表示
+  function showOriginalInstruction() {
+    const view = document.getElementById('originalInstructionView');
+    if (view) view.textContent = lastOriginalInstruction || '（原文はありません）';
+    const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('originalInstructionModal'));
+    modal.show();
+  }
+
+  // 原文をプロンプト欄に書き戻す
+  function restoreOriginalInstruction() {
+    if (!lastOriginalInstruction) {
+      bootstrap.Modal.getInstance(document.getElementById('originalInstructionModal')).hide();
+      return;
+    }
+    const current = document.getElementById('promptEditPrompt').value;
+    if (current && current !== lastOriginalInstruction) {
+      if (!confirm('現在のプロンプト欄の内容を原文で上書きします。よろしいですか？')) return;
+    }
+    document.getElementById('promptEditPrompt').value = lastOriginalInstruction;
+    bootstrap.Modal.getInstance(document.getElementById('originalInstructionModal')).hide();
+  }
+
+  const PDF_ZOOM_STEPS = [50, 75, 100, 125, 150, 175, 200, 250, 300];
+
+  function zoomPdf(direction) {
+    const idx = PDF_ZOOM_STEPS.indexOf(pdfZoom);
+    const next = Math.min(Math.max(idx + direction, 0), PDF_ZOOM_STEPS.length - 1);
+    pdfZoom = PDF_ZOOM_STEPS[next];
+    document.getElementById('pdfZoomLabel').textContent = pdfZoom + '%';
+    document.querySelectorAll('#pdfPages img').forEach(img => {
+      img.style.width = pdfZoom + '%';
+    });
+  }
+
+  // =============================================
+  // テキスト正規化（AIの出力を確実に補正）
+  // =============================================
+
+  // 全角カタカナ → 半角カタカナ変換
+  // ※ ヶ（ヶ所の ヶ）は半角に相当文字がないため変換しない
+  function toHalfWidthKatakana(str) {
+    const map = {
+      'ア':'ｱ','イ':'ｲ','ウ':'ｳ','エ':'ｴ','オ':'ｵ',
+      'カ':'ｶ','キ':'ｷ','ク':'ｸ','ケ':'ｹ','コ':'ｺ',
+      'サ':'ｻ','シ':'ｼ','ス':'ｽ','セ':'ｾ','ソ':'ｿ',
+      'タ':'ﾀ','チ':'ﾁ','ツ':'ﾂ','テ':'ﾃ','ト':'ﾄ',
+      'ナ':'ﾅ','ニ':'ﾆ','ヌ':'ﾇ','ネ':'ﾈ','ノ':'ﾉ',
+      'ハ':'ﾊ','ヒ':'ﾋ','フ':'ﾌ','ヘ':'ﾍ','ホ':'ﾎ',
+      'マ':'ﾏ','ミ':'ﾐ','ム':'ﾑ','メ':'ﾒ','モ':'ﾓ',
+      'ヤ':'ﾔ','ユ':'ﾕ','ヨ':'ﾖ',
+      'ラ':'ﾗ','リ':'ﾘ','ル':'ﾙ','レ':'ﾚ','ロ':'ﾛ',
+      'ワ':'ﾜ','ヲ':'ｦ','ン':'ﾝ',
+      'ァ':'ｧ','ィ':'ｨ','ゥ':'ｩ','ェ':'ｪ','ォ':'ｫ',
+      'ッ':'ｯ','ャ':'ｬ','ュ':'ｭ','ョ':'ｮ',
+      'ガ':'ｶﾞ','ギ':'ｷﾞ','グ':'ｸﾞ','ゲ':'ｹﾞ','ゴ':'ｺﾞ',
+      'ザ':'ｻﾞ','ジ':'ｼﾞ','ズ':'ｽﾞ','ゼ':'ｾﾞ','ゾ':'ｿﾞ',
+      'ダ':'ﾀﾞ','ヂ':'ﾁﾞ','ヅ':'ﾂﾞ','デ':'ﾃﾞ','ド':'ﾄﾞ',
+      'バ':'ﾊﾞ','ビ':'ﾋﾞ','ブ':'ﾌﾞ','ベ':'ﾍﾞ','ボ':'ﾎﾞ',
+      'パ':'ﾊﾟ','ピ':'ﾋﾟ','プ':'ﾌﾟ','ペ':'ﾍﾟ','ポ':'ﾎﾟ',
+      'ヴ':'ｳﾞ','ー':'ｰ','・':'･',
+    };
+    return str.replace(/[ァ-ヴーヷヺ・]/g, ch => map[ch] || ch);
+  }
+
+  // 文字列フィールドを一括正規化（プロンプトで対応しきれなかった場合の安全網）
+  // メートル系単位ルール:
+  //   - 単独の「m」（メートル単位） → 全角「ｍ」
+  //   - m2 / m3 / cm / mm / km / km2 → 半角
+  function normalizeText(val) {
+    if (typeof val !== 'string') return val;
+    return val
+      .replace(/㎡/g, 'm2')   // ① 単位記号
+      .replace(/㎥/g, 'm3')
+      .replace(/㎢/g, 'km2')
+      // ③ メートル系単位の全角→半角統一（m2 / m3 / cm / mm / km）
+      .replace(/[ｍＭ]\s*[2２]/g, 'm2')
+      .replace(/[ｍＭ]\s*[3３]/g, 'm3')
+      .replace(/[ｃＣ][ｍＭ]/g, 'cm')
+      .replace(/[ｍＭ][ｍＭ]/g, 'mm')
+      .replace(/[ｋＫ][ｍＭ]/g, 'km')
+      // ④ 単独メートル「m」のみ全角に（前後がアルファベット/数字でない m が対象）
+      //    例: 「1m」→「1ｍ」, 「m」→「ｍ」, 「2m50cm」→「2ｍ50cm」
+      //    cm / mm / km の m や m2 / m3 の m は前段で半角統一済みのため lookbehind/lookahead で除外
+      .replace(/(?<![a-zA-Z])[mＭ](?![a-zA-Z0-9])/g, 'ｍ')
+      .replace(/箇所/g, 'ヶ所') // ⑤ 箇所 → ヶ所
+      .replace(/[ァ-ヴーヷヺ・]/g, ch => toHalfWidthKatakana(ch) || ch); // ⑥ 全角→半角カタカナ
+  }
+
+  // rowオブジェクトのテキストフィールドをまとめて正規化
+  function normalizeRow(row) {
+    return {
+      ...row,
+      name:       normalizeText(row.name       || ''),
+      dimension:  normalizeText(row.dimension  || ''),
+      unit:       normalizeText(row.unit       || ''),
+      memo:       normalizeText(row.memo       || ''),
+    };
+  }
+
+  async function processFile() {
+    const fileInput = document.getElementById('fileInput');
+    const file = fileInput.files[0];
+    if (!file) {
+      alert("PDFファイルを選択してください。");
+      return;
+    }
+
+    const promptId = document.getElementById('workType').value;
+    if (!promptId) {
+      alert('種別を選択してください。');
+      return;
+    }
+
+    document.getElementById('loading').classList.remove('d-none');
+    document.getElementById('loadingText').textContent = 'PDFを読み込み中...';
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+      const total = pdf.numPages;
+
+      pageDataUrls = new Array(total);
+      const allRows = new Array(total).fill(null);
+      let done = 0;
+
+      document.getElementById('loadingText').textContent = `AIが解析中です... 0 / ${total} ページ`;
+
+      // ページのレンダリングとAI送信をパイプライン処理（同時5ページまで）
+      const CONCURRENCY = 5;
+      let active = 0;
+      let nextPage = 1;
+
+      await new Promise((resolveAll) => {
+        let completed = 0;
+
+        function startNext() {
+          while (active < CONCURRENCY && nextPage <= total) {
+            const pageIndex = nextPage - 1;
+            const pageNum = nextPage;
+            nextPage++;
+            active++;
+
+            renderOnePage(pdf, pageNum).then(({dataUrl, base64}) => {
+              pageDataUrls[pageIndex] = dataUrl;
+              google.script.run
+                .withSuccessHandler((result) => {
+                  if (isUnauthorizedRes(result)) {
+                    handleUnauthorized();
+                    active--;
+                    completed++;
+                    if (completed === total) resolveAll();
+                    return;
+                  }
+                  try {
+                    const rows = JSON.parse(result);
+                    if (Array.isArray(rows)) allRows[pageIndex] = rows;
+                  } catch(e) {}
+                  done++;
+                  document.getElementById('loadingText').textContent =
+                    `AIが解析中です... ${done} / ${total} ページ`;
+                  active--;
+                  completed++;
+                  if (completed === total) resolveAll();
+                  else startNext();
+                })
+                .withFailureHandler((err) => {
+                  console.error('ページ処理エラー:', err && err.message);
+                  done++;
+                  document.getElementById('loadingText').textContent =
+                    `AIが解析中です... ${done} / ${total} ページ（エラーあり）`;
+                  active--;
+                  completed++;
+                  if (completed === total) {
+                    if (allRows.every(r => r === null)) {
+                      alert('エラー: ' + (err && err.message ? err.message : 'AIとの通信に失敗しました。'));
+                    }
+                    resolveAll();
+                  } else startNext();
+                })
+                .processSinglePage(getToken(), base64, promptId);
+            }).catch(() => {
+              active--;
+              completed++;
+              if (completed === total) resolveAll();
+              else startNext();
+            });
+          }
+        }
+
+        startNext();
+      });
+
+      const merged = allRows.flat().filter(r => r !== null);
+      displayResult(JSON.stringify(merged));
+    } catch (e) {
+      document.getElementById('loading').classList.add('d-none');
+      alert('PDFの読み込みに失敗しました: ' + e.message);
+    }
+  }
+
+  // 1ページをJPEG画像（base64）に変換
+  async function renderOnePage(pdf, pageNum) {
+    const page = await pdf.getPage(pageNum);
+    const viewport = page.getViewport({scale: 1.5}); // 2.0→1.5: 高速化（OCR精度は維持）
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({canvasContext: canvas.getContext('2d'), viewport}).promise;
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+    return {dataUrl, base64: dataUrl.split(',')[1]};
+  }
+
+  // 1行分のtr要素を生成
+  function createRow(row, index) {
+    const tr = document.createElement('tr');
+
+    // 操作列：削除（✕）＋ 直下に挿入（＋）
+    const tdOp = document.createElement('td');
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn btn-danger btn-row-op me-1';
+    delBtn.textContent = '✕';
+    delBtn.title = 'この行を削除';
+    delBtn.onclick = () => { currentData.splice(index, 1); renderTable(); };
+
+    const insBtn = document.createElement('button');
+    insBtn.className = 'btn btn-success btn-row-op';
+    insBtn.textContent = '＋';
+    insBtn.title = 'この行の下に空行を挿入';
+    insBtn.onclick = () => {
+      currentData.splice(index + 1, 0, {name:'', dimension:'', quantity:'', unit:'', unit_price:'', amount:'', memo:''});
+      renderTable();
+    };
+    tdOp.appendChild(delBtn);
+    tdOp.appendChild(insBtn);
+    tr.appendChild(tdOp);
+
+    // 番号（編集不可）
+    const tdNum = document.createElement('td');
+    tdNum.textContent = index + 1;
+    tr.appendChild(tdNum);
+
+    // 編集可能フィールド
+    const editFields = [
+      {field: 'name',       value: row.name || ''},
+      {field: 'dimension',  value: row.dimension || ''},
+      {field: 'quantity',   value: row.quantity || ''},
+      {field: 'unit',       value: row.unit || ''},
+      {field: 'unit_price', value: row.unit_price ? Number(row.unit_price).toLocaleString() : ''},
+      {field: 'amount',     value: row.amount ? Number(row.amount).toLocaleString() : ''},
+    ];
+    editFields.forEach(({field, value}) => {
+      const td = document.createElement('td');
+      td.textContent = value;
+      td.contentEditable = 'true';
+      td.addEventListener('blur', () => {
+        let val = td.textContent.trim();
+        if (field === 'unit_price' || field === 'amount' || field === 'quantity') val = val.replace(/,/g, '');
+        currentData[index][field] = val;
+      });
+      tr.appendChild(td);
+    });
+
+    // 小計（空・編集不可）
+    tr.appendChild(document.createElement('td'));
+
+    // 摘要（編集可能）
+    const tdMemo = document.createElement('td');
+    tdMemo.textContent = row.memo || '';
+    tdMemo.contentEditable = 'true';
+    tdMemo.addEventListener('blur', () => { currentData[index].memo = tdMemo.textContent.trim(); });
+    tr.appendChild(tdMemo);
+
+    return tr;
+  }
+
+  // テーブル全体を再描画
+  function renderTable() {
+    const tbody = document.getElementById('resultBody');
+    tbody.innerHTML = '';
+    currentData.forEach((row, index) => tbody.appendChild(createRow(row, index)));
+  }
+
+  // 末尾に空行を追加
+  function addRow() {
+    currentData.push({name:'', dimension:'', quantity:'', unit:'', unit_price:'', amount:'', memo:''});
+    renderTable();
+    const scrollArea = document.querySelector('.result-scroll-area');
+    scrollArea.scrollTop = scrollArea.scrollHeight;
+  }
+
+  // 列幅をドラッグで変更できるハンドルを設置（初回のみ）
+  function initColResizers() {
+    const table = document.getElementById('resultTable');
+    if (table._colResizersReady) return;
+    table._colResizersReady = true;
+
+    const cols = document.querySelectorAll('#tableColGroup col');
+    const ths  = document.querySelectorAll('#resultTable thead th');
+
+    ths.forEach((th, i) => {
+      if (i === ths.length - 1) return; // 最終列にはハンドル不要
+      const handle = document.createElement('div');
+      handle.className = 'col-resizer';
+      th.appendChild(handle);
+
+      handle.addEventListener('mousedown', (e) => {
+        const startX   = e.clientX;
+        const startW   = cols[i].offsetWidth;
+        const startNW  = cols[i + 1].offsetWidth;
+        const tableW   = table.offsetWidth;
+
+        handle.classList.add('col-resizing');
+        document.body.style.cursor    = 'col-resize';
+        document.body.style.userSelect = 'none';
+
+        const onMove = (e) => {
+          const dx   = e.clientX - startX;
+          const newW  = Math.max(30, startW  + dx);
+          const newNW = Math.max(30, startNW - dx);
+          cols[i].style.width     = (newW  / tableW * 100).toFixed(2) + '%';
+          cols[i+1].style.width   = (newNW / tableW * 100).toFixed(2) + '%';
+        };
+        const onUp = () => {
+          handle.classList.remove('col-resizing');
+          document.body.style.cursor    = '';
+          document.body.style.userSelect = '';
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+        e.preventDefault();
+        e.stopPropagation();
+      });
+    });
+  }
+
+  // 解析完了後: テーブル描画 + 分割表示へ切り替え
+  function displayResult(response) {
+    document.getElementById('loading').classList.add('d-none');
+
+    try {
+      const data = JSON.parse(response);
+      currentData = data.map(normalizeRow);
+
+      // 右パネル: OCRデータをテーブルに描画
+      renderTable();
+
+      // 左パネル: 原本PDFの各ページ画像を表示
+      const pdfPages = document.getElementById('pdfPages');
+      pdfPages.innerHTML = '';
+      pageDataUrls.forEach((dataUrl, i) => {
+        const label = document.createElement('div');
+        label.className = 'page-label';
+        label.textContent = `ページ ${i + 1}`;
+        const img = document.createElement('img');
+        img.src = dataUrl;
+        img.alt = `ページ ${i + 1}`;
+        pdfPages.appendChild(label);
+        pdfPages.appendChild(img);
+      });
+
+      // 分割表示へ切り替え
+      document.getElementById('inputSection').classList.add('d-none');
+      document.getElementById('splitView').classList.remove('d-none');
+      initResizer();
+      initColResizers();
+
+    } catch (e) {
+      alert("AIの解析結果の読み取りに失敗しました。再度お試しください。");
+      console.error(e);
+    }
+  }
+
+  // 左右パネルのリサイズ処理
+  function initResizer() {
+    const resizer = document.getElementById('panelResizer');
+    if (!resizer || resizer._initialized) return;
+    resizer._initialized = true;
+
+    const splitBody = document.querySelector('.split-body');
+    const leftPanel = document.querySelector('.split-left');
+    const rightPanel = document.querySelector('.split-right');
+    let isResizing = false;
+
+    resizer.addEventListener('mousedown', (e) => {
+      isResizing = true;
+      resizer.classList.add('resizing');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (!isResizing) return;
+      const rect = splitBody.getBoundingClientRect();
+      const offset = e.clientX - rect.left;
+      const totalWidth = rect.width;
+      const resizerW = resizer.offsetWidth;
+      const leftPx = Math.min(Math.max(offset, totalWidth * 0.15), totalWidth * 0.85);
+      leftPanel.style.width  = (leftPx / totalWidth * 100).toFixed(2) + '%';
+      rightPanel.style.width = ((totalWidth - leftPx - resizerW) / totalWidth * 100).toFixed(2) + '%';
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (!isResizing) return;
+      isResizing = false;
+      resizer.classList.remove('resizing');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    });
+  }
+
+  // 入力フォームに戻る
+  function backToInput() {
+    document.getElementById('splitView').classList.add('d-none');
+    document.getElementById('inputSection').classList.remove('d-none');
+  }
+
+  // サーバー通信エラー時の処理
+  function showError(error) {
+    document.getElementById('loading').classList.add('d-none');
+    alert("通信エラーが発生しました: " + error.message);
+  }
+
+  // 17列レイアウトでの数値列インデックス（A:番号, E:数量, H:単価, J:金額, K:小計）
+  const NUMERIC_COL_INDEXES = [0, 4, 7, 9, 10];
+
+  // 17列レイアウトでのセル結合範囲（[開始列, 終了列] / 0-indexed）
+  // B-C(名称), E-F(数量), H-I(単価), L-Q(摘要)
+  const MERGE_RANGES = [[1, 2], [4, 5], [7, 8], [11, 16]];
+
+  // 値を数値として解釈できれば数値、そうでなければ文字列として返す
+  function parseNumeric(v) {
+    if (v === '' || v == null) return { isNumber: false, value: '' };
+    const str = String(v).trim();
+    if (str === '') return { isNumber: false, value: '' };
+    // カンマ区切りを含む数値表記のみ許容（例: 1,234.5 / -100 / 0.25）
+    if (!/^-?\d{1,3}(,\d{3})*(\.\d+)?$|^-?\d+(\.\d+)?$/.test(str)) {
+      return { isNumber: false, value: str };
+    }
+    const num = parseFloat(str.replace(/,/g, ''));
+    if (!isFinite(num)) return { isNumber: false, value: str };
+    return { isNumber: true, value: num };
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  // 17列分のExcel形式データ配列を生成（A〜Q列）
+  // A:番号, B:名称, C:空(B-C結合), D:形状寸法, E:数量, F:空(E-F結合),
+  // G:単位, H:単価, I:空(H-I結合), J:金額, K:小計, L:摘要, M-Q:空(L-Q結合)
+  function buildExcelRows() {
+    return currentData.map((row, index) => [
+      index + 1,           // A: 番号
+      row.name || '',      // B: 名称
+      '',                  // C: (B-C結合のため空)
+      row.dimension || '', // D: 形状寸法
+      row.quantity || '',  // E: 数量
+      '',                  // F: (E-F結合のため空)
+      row.unit || '',      // G: 単位
+      row.unit_price || '', // H: 単価
+      '',                  // I: (I-J結合のため空)
+      row.amount || '',    // J: 金額
+      '',                  // K: 小計
+      row.memo || '',      // L: 摘要
+      '', '', '', '', ''   // M-Q: (L-Q結合のため空)
+    ]);
+  }
+
+  // Excel (.xlsx) ダウンロード処理
+  // 17列レイアウト・セル結合・数値型を保持して出力
+  function downloadExcel() {
+    if (currentData.length === 0) return;
+    if (typeof XLSX === 'undefined') {
+      alert('Excelエクスポート用ライブラリの読み込みに失敗しています。再読み込みしてお試しください。');
+      return;
+    }
+
+    const headers = ['番号','名称','','形状寸法','数量','','単位','単価','','金額','小計','摘要','','','','',''];
+    const dataRows = buildExcelRows();
+    const ws = {};
+    const totalRows = dataRows.length + 1; // header + data
+
+    headers.forEach((h, c) => {
+      ws[XLSX.utils.encode_cell({ c, r: 0 })] = { t: 's', v: h };
+    });
+
+    dataRows.forEach((row, ri) => {
+      row.forEach((cell, ci) => {
+        const addr = XLSX.utils.encode_cell({ c: ci, r: ri + 1 });
+        if (NUMERIC_COL_INDEXES.includes(ci)) {
+          const parsed = parseNumeric(cell);
+          ws[addr] = parsed.isNumber
+            ? { t: 'n', v: parsed.value }
+            : { t: 's', v: String(cell == null ? '' : cell) };
+        } else {
+          ws[addr] = { t: 's', v: String(cell == null ? '' : cell) };
+        }
+      });
+    });
+
+    // セル結合（全行に適用）
+    ws['!merges'] = [];
+    for (let r = 0; r < totalRows; r++) {
+      MERGE_RANGES.forEach(([s, e]) => {
+        ws['!merges'].push({ s: { c: s, r }, e: { c: e, r } });
+      });
+    }
+
+    // 列幅
+    ws['!cols'] = [
+      { wch: 6 },  { wch: 18 }, { wch: 18 }, { wch: 14 },
+      { wch: 8 },  { wch: 8 },  { wch: 6 },  { wch: 10 },
+      { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 12 },
+      { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 },
+    ];
+
+    ws['!ref'] = XLSX.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: 16, r: totalRows - 1 } });
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, '見積書');
+    XLSX.writeFile(wb, '見積書_読取データ.xlsx');
+  }
+
+  // Word (.doc) ダウンロード処理
+  // Word互換のHTMLを application/msword で出力し、Wordで開けるようにする
+  function downloadWord() {
+    if (currentData.length === 0) return;
+
+    const renderCell = (idx, val, opts = {}) => {
+      const colspan = opts.colspan ? ` colspan="${opts.colspan}"` : '';
+      if (NUMERIC_COL_INDEXES.includes(idx)) {
+        const parsed = parseNumeric(val);
+        if (parsed.isNumber) {
+          return `<td${colspan} style="mso-number-format:'#,##0.###'; text-align:right;">${parsed.value}</td>`;
+        }
+      }
+      return `<td${colspan}>${escapeHtml(val)}</td>`;
+    };
+
+    let body = '';
+    body += '<tr>'
+      + '<th>番号</th>'
+      + '<th colspan="2">名称</th>'
+      + '<th>形状寸法</th>'
+      + '<th colspan="2">数量</th>'
+      + '<th>単位</th>'
+      + '<th colspan="2">単価</th>'
+      + '<th>金額</th>'
+      + '<th>小計</th>'
+      + '<th colspan="6">摘要</th>'
+      + '</tr>';
+
+    buildExcelRows().forEach((cols) => {
+      body += '<tr>'
+        + renderCell(0, cols[0])
+        + renderCell(1, cols[1], { colspan: 2 })   // B-C 名称
+        + renderCell(3, cols[3])                   // D 形状寸法
+        + renderCell(4, cols[4], { colspan: 2 })   // E-F 数量
+        + renderCell(6, cols[6])                   // G 単位
+        + renderCell(7, cols[7], { colspan: 2 })   // H-I 単価
+        + renderCell(9, cols[9])                   // J 金額
+        + renderCell(10, cols[10])                 // K 小計
+        + renderCell(11, cols[11], { colspan: 6 }) // L-Q 摘要
+        + '</tr>';
+    });
+
+    const html =
+      '<!DOCTYPE html>\n'
+      + '<html xmlns:o="urn:schemas-microsoft-com:office:office" '
+      +       'xmlns:w="urn:schemas-microsoft-com:office:word" '
+      +       'xmlns="http://www.w3.org/TR/REC-html40">\n'
+      + '<head><meta charset="utf-8"><title>見積書 読取データ</title>\n'
+      + '<style>\n'
+      + '  body { font-family: "Yu Gothic", "MS Gothic", sans-serif; font-size: 10.5pt; }\n'
+      + '  h2 { font-size: 14pt; }\n'
+      + '  table { border-collapse: collapse; width: 100%; }\n'
+      + '  th, td { border: 1px solid #000; padding: 4px 6px; vertical-align: middle; }\n'
+      + '  th { background: #e9e9e9; text-align: center; }\n'
+      + '</style>\n'
+      + '</head>\n'
+      + '<body>\n'
+      + '<h2>見積書 読取データ</h2>\n'
+      + '<table>' + body + '</table>\n'
+      + '</body></html>';
+
+    const blob = new Blob(['﻿', html], { type: 'application/msword;charset=utf-8' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = '見積書_読取データ.doc';
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  // CSVダウンロード処理
+  function downloadCSV() {
+    if (currentData.length === 0) return;
+
+    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+
+    let csvContent = "番号,名称,,形状寸法,数量,,単位,単価,,金額,小計,摘要,,,,,\n";
+
+    buildExcelRows().forEach((cols) => {
+      const rowData = cols.map((v, i) => {
+        const strCols = [1, 2, 3, 6, 11, 12, 13, 14, 15, 16];
+        return strCols.includes(i) ? `"${String(v).replace(/"/g, '""')}"` : v;
+      });
+      csvContent += rowData.join(",") + "\n";
+    });
+
+    const blob = new Blob([bom, csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    link.setAttribute("href", url);
+    link.setAttribute("download", "見積書_読取データ.csv");
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  // クリップボードコピー処理（タブ区切り、Excelに直接貼り付け可能）
+  function copyToClipboard() {
+    if (currentData.length === 0) return;
+
+    // A〜H列（番号・名称・空・形状寸法・数量・空・単位・単価）のみコピー
+    const clipboardText = buildExcelRows()
+      .map(cols => cols.slice(0, 8).join('\t'))
+      .join('\n');
+
+    navigator.clipboard.writeText(clipboardText).then(() => {
+      const btn = document.getElementById('copyBtn');
+      const originalText = btn.textContent;
+      btn.textContent = 'コピーしました！';
+      btn.classList.remove('btn-info');
+      btn.classList.add('btn-secondary');
+      setTimeout(() => {
+        btn.textContent = originalText;
+        btn.classList.remove('btn-secondary');
+        btn.classList.add('btn-info');
+      }, 2000);
+    }).catch(() => {
+      alert('クリップボードへのコピーに失敗しました。');
+    });
+  }
+</script>
