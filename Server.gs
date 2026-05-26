@@ -22,7 +22,6 @@ function getGeminiApiKey_() {
   }
   
   const json = JSON.parse(response.getContentText());
-  // Base64 デコード後に、末尾の改行や空白を除去
   const decodedKey = Utilities.newBlob(Utilities.base64Decode(json.payload.data)).getDataAsString().trim();
   
   return decodedKey;
@@ -36,6 +35,7 @@ function processSinglePage(token, pageBase64, promptId) {
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
   const fullPrompt = getCommonRules_() + '\n' + getPromptById_(promptId);
+  
   const payload = {
     contents: [{
       parts: [
@@ -43,6 +43,12 @@ function processSinglePage(token, pageBase64, promptId) {
         {inlineData: {mimeType: 'image/jpeg', data: pageBase64}}
       ]
     }],
+    safetySettings: [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+    ],
     generationConfig: {
       temperature: 0.1,
       responseMimeType: 'application/json',
@@ -69,35 +75,32 @@ function processSinglePage(token, pageBase64, promptId) {
 
   if (json.error) throw new Error(json.error.message);
 
-  // ▼ 構造をより柔軟に、安全に解析するロジックに変更 ▼
-  try {
-    const candidates = json.candidates;
-    if (!candidates || !Array.isArray(candidates) || candidates.length === 0) {
-      throw new Error("候補(candidates)が見つかりません。");
+  // ▼ どんな階層構造でも "text" を探し出して一番長いもの(実データ)を強制抽出する ▼
+  let extractedText = "";
+  function findLongestText(obj) {
+    if (obj && typeof obj === 'object') {
+      // "text"が文字列であり、思考プロセス(thought)ではない場合をピックアップ
+      if (typeof obj.text === 'string' && obj.thought !== true) {
+        if (obj.text.length > extractedText.length) {
+          extractedText = obj.text;
+        }
+      }
+      // 子要素をさらに奥深くまで探索
+      for (let key in obj) {
+        findLongestText(obj[key]);
+      }
     }
-
-    const content = candidates.content;
-    if (!content) {
-      const reason = candidates.finishReason || '不明';
-      throw new Error(`AIの生成がブロックまたは中断されました。(理由: ${reason})`);
-    }
-
-    const parts = content.parts;
-    if (!parts || !Array.isArray(parts) || parts.length === 0) {
-      throw new Error("パーツ(parts)が見つかりません。");
-    }
-
-    const textPart = parts.filter(p => p.text && !p.thought).pop() || parts[parts.length - 1];
-    if (!textPart || !textPart.text) {
-      throw new Error("抽出されたテキストデータが見つかりません。");
-    }
-
-    return textPart.text;
-    
-  } catch (e) {
-    // 構造解析でエラーになった場合のみ、詳細なエラーを投げる
-    throw new Error(`AI応答の解析エラー: ${e.message}`);
   }
+  
+  findLongestText(json.candidates);
+
+  if (!extractedText || extractedText.trim() === "") {
+    let reason = "不明";
+    try { reason = json.candidates.finishReason || reason; } catch(e) {}
+    throw new Error(`テキストデータを抽出できませんでした (理由: ${reason})。API生レスポンス: ` + responseText.substring(0, 300));
+  }
+
+  return extractedText.trim();
 }
 
 // ユーザーが入力した「読み取り要調整部分」の指示文から、OCR抽出用プロンプトをAI生成
@@ -158,6 +161,12 @@ ${instruction || '(なし)'}
         {text: metaPrompt}
       ]
     }],
+    safetySettings: [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+    ],
     generationConfig: {
       temperature: 0.3
     }
@@ -170,23 +179,39 @@ ${instruction || '(なし)'}
     muteHttpExceptions: true
   });
   
-  const json = JSON.parse(response.getContentText());
+  const responseText = response.getContentText();
+  let json;
+  try {
+    json = JSON.parse(responseText);
+  } catch (e) {
+    throw new Error('APIから無効なレスポンスが返されました: ' + responseText.substring(0, 200));
+  }
+
   if (json.error) throw new Error(json.error.message);
 
-  // ▼ こちらも安全に取り出すように修正 ▼
-  try {
-    const candidates = json.candidates;
-    if (!candidates || !Array.isArray(candidates) || candidates.length === 0) throw new Error("候補が見つかりません。");
-    const content = candidates.content;
-    if (!content) throw new Error(`生成ブロック (理由: ${candidates.finishReason || '不明'})`);
-    const parts = content.parts;
-    if (!parts || !Array.isArray(parts) || parts.length === 0) throw new Error("パーツが見つかりません。");
-    
-    const textPart = parts.filter(p => p.text && !p.thought).pop() || parts[parts.length - 1];
-    let text = (textPart && textPart.text) ? textPart.text : '';
-    text = text.replace(/^\s*```[a-zA-Z]*\s*\n/, '').replace(/\n```\s*$/, '').trim();
-    return text;
-  } catch(e) {
-    throw new Error(`プロンプト生成エラー: ${e.message}`);
+  let extractedText = "";
+  function findLongestText(obj) {
+    if (obj && typeof obj === 'object') {
+      if (typeof obj.text === 'string' && obj.thought !== true) {
+        if (obj.text.length > extractedText.length) {
+          extractedText = obj.text;
+        }
+      }
+      for (let key in obj) {
+        findLongestText(obj[key]);
+      }
+    }
   }
+  
+  findLongestText(json.candidates);
+
+  if (!extractedText || extractedText.trim() === "") {
+    let reason = "不明";
+    try { reason = json.candidates.finishReason || reason; } catch(e) {}
+    throw new Error(`プロンプト生成中にテキストデータを抽出できませんでした (理由: ${reason})。API生レスポンス: ` + responseText.substring(0, 300));
+  }
+
+  // コードブロック装飾が付いた場合は除去
+  let text = extractedText.trim().replace(/^\s*```[a-zA-Z]*\s*\n/, '').replace(/\n```\s*$/, '').trim();
+  return text;
 }
