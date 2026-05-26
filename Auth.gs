@@ -7,7 +7,7 @@
 //   「使用履歴」     A列: タイムスタンプ / B列: 認証に使ったパスワード
 // =============================================
 const SHEET_NAME_USERS = 'ユーザー一覧';
-const SHEET_NAME_LOGS  = '使用履歴';
+const SHEET_NAME_LOGS  = '見積OCRアプリ';
 const AUTH_TTL_SECONDS = 21600; // 6時間（CacheService最大）
 
 function getAuthSpreadsheetId_() {
